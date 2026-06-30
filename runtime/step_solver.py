@@ -89,13 +89,33 @@ def build_plan(
     )
 
 
-def measure_throughput(*_args, **_kwargs) -> float:
-    """Live it/s measurement over the first DEFAULT_TIMING_STEPS.
+def measure_throughput(step_iter=None, n_steps: int = DEFAULT_TIMING_STEPS) -> float:
+    """Live it/s over the first `n_steps` from a trainer step source.
 
-    STUB (Fase 1): the real measurement hooks into the trainer's step callback and
-    is wired in Fase 2 once the recipe drives an actual training loop. Raising here
-    is deliberate — we must NOT fabricate a throughput number.
+    Structure is wired (Fase 2a-1): it consumes `n_steps` items from `step_iter`
+    (the trainer's per-step callback/generator) and returns steps/sec. But it REFUSES
+    to run without CUDA — there is no honest it/s to report on CPU, and fabricating one
+    would corrupt the step solver. The live measurement happens in Fase 2a-2 on GPU.
     """
-    raise NotImplementedError(
-        "measure_throughput is a Fase 2 hook; wire it to the trainer step callback."
-    )
+    try:
+        import torch
+        has_cuda = bool(torch.cuda.is_available())
+    except Exception:
+        has_cuda = False
+    if not has_cuda:
+        raise RuntimeError(
+            "measure_throughput needs CUDA + a live trainer step source (Fase 2a-2). "
+            "Refusing to fabricate it/s on CPU."
+        )
+    if step_iter is None:
+        raise RuntimeError("measure_throughput needs a step_iter (trainer step callback).")
+
+    import time
+    start = time.perf_counter()
+    count = 0
+    for _ in zip(range(n_steps), step_iter):
+        count += 1
+    elapsed = time.perf_counter() - start
+    if count == 0 or elapsed <= 0:
+        raise RuntimeError("measure_throughput measured no steps")
+    return count / elapsed

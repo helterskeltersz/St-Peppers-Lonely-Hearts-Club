@@ -23,6 +23,7 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3 python3-pip python3-dev build-essential \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # torch / torchvision pins (§5b: torch==2.6.0 torchvision==0.21.0, cu124).
@@ -39,9 +40,12 @@ RUN git clone ${SD_SCRIPTS_REPO} /app/sd-scripts && \
 # checkpoints actually load at inference before relying on them.
 RUN python3 -m pip install "lycoris-lora==3.3.0"
 
-# Runtime helper deps used by the entrypoint / server.
+# Runtime helper deps used by the entrypoint / server / classifier.
+# pytesseract -> ocr_area_ratio (tesseract binary above); open_clip_torch -> subject_variance
+# (CLIP path; classifier falls back to a PIL/numpy proxy if CLIP weights are absent).
 RUN python3 -m pip install \
-        "fastapi" "uvicorn" "pydantic" "Pillow==11.1.0" "numpy" "PyYAML" "toml" "huggingface_hub"
+        "fastapi" "uvicorn" "pydantic" "Pillow==11.1.0" "numpy" "PyYAML" "toml" "huggingface_hub" \
+        "pytesseract" "open_clip_torch"
 
 # Working dirs (validator mounts /cache ro and /app/checkpoints rw at run time).
 RUN mkdir -p /dataset/configs /dataset/images /dataset/outputs /app/checkpoints /workspace
