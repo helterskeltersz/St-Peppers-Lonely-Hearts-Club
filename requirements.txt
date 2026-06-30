@@ -1,0 +1,4 @@
+# Host-side / scaffold deps only. The training containers install their own heavy
+# stacks (torch, sd-scripts, ai-toolkit) — see ops/docker/*.dockerfile.
+fastapi
+uvicorn

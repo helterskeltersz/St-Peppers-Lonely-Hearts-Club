@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+*.env
+/data/
+/dataset/configs/
+/dataset/images/
+/dataset/outputs/
+/app/
+.pytest_cache/
+.DS_Store
