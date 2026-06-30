@@ -24,6 +24,17 @@ from runtime.subtype_classifier import BUCKET_AGGRESSIVE, BUCKET_PRIOR, BUCKET_L
 DEFAULT_CAPTION_DROPOUT = 0.30
 CAPTION_DROPOUT_RANGE = (0.30, 0.50)
 
+# Logo bucket caption_dropout is PER-ARCH (📐), not flat. Rationale (also in _apply_bucket):
+# the metric is pixel-L2 (not OCR), dominated by low-freq that transfers to the unconditional
+# path -> moderate dropout, tuned to denoise strength (higher denoise = conditioning matters
+# more = lower dropout). Higher-denoise arches (Qwen 0.93 / Z 0.90) keep more caption signal.
+LOGO_CAPTION_DROPOUT = {
+    "qwen-image": 0.15,  # 📐 denoise 0.93 (highest) -> lowest dropout
+    "z-image": 0.20,     # 📐 denoise 0.90
+    "flux": 0.25,        # 📐 denoise 0.75
+    "sdxl": 0.30,        # 📐 denoise 0.90 but epsilon model -> keep at §3a default
+}
+
 
 @dataclass
 class Recipe:
@@ -50,6 +61,8 @@ class Recipe:
     train_batch_size: int | None = None
     repeats: int | None = None
     max_train_steps: int | None = None       # FALLBACK; solver overrides at runtime
+    train_unet_only: bool | None = None      # SDXL: True (drop both TEs); Flux: False
+    flip_aug: bool | None = None             # None = trainer default; logo bucket -> False
     # --- §3a unconditional strategy ---
     caption_dropout_rate: float | None = None
     drop_trigger_word: bool | None = None
@@ -75,7 +88,10 @@ def _baseline(model_type: str) -> Recipe:
             network_kind="lora",      # ✅ networks.lora :38
             learning_rate=1e-5,       # ✅ :20  (NOT 1e-4 — old claim KILLED)
             unet_lr=1e-5,             # ✅ :58
-            text_encoder_lr=1e-5,     # ✅ :54
+            text_encoder_lr=None,     # ✅ DECISION: SDXL UNet-only ALL buckets -> no TE LR.
+                                      #    Two SDXL TEs destabilize training + the 0.75 no-text
+                                      #    strategy discards the conditional path -> TE training is
+                                      #    wasted. (consistent matriks §3)
             optimizer="AdamW8Bit",    # ✅ :42
             scheduler="constant",     # ✅ :22
             min_snr_gamma=5,          # ✅ :33 (active for SDXL)
@@ -83,6 +99,7 @@ def _baseline(model_type: str) -> Recipe:
             train_batch_size=4,       # ✅ :55
             repeats=10,               # ✅ DIFFUSION_SDXL_REPEATS trainer/constants.py:63
             max_train_steps=1600,     # ✅ :31 (fallback ceiling)
+            train_unet_only=True,     # ✅ DECISION: SDXL UNet-only (all buckets)
         )
     if model_type == "flux":
         return Recipe(
@@ -101,6 +118,7 @@ def _baseline(model_type: str) -> Recipe:
             train_batch_size=1,       # ✅ :60
             repeats=1,                # ✅ DIFFUSION_FLUX_REPEATS trainer/constants.py:64
             max_train_steps=3000,     # ✅ :33 (fallback ceiling)
+            train_unet_only=False,    # ✅ Flux: TE trains (TE-cache OFF for caption_dropout, §5b)
         )
     if model_type == "qwen-image":
         return Recipe(
@@ -179,14 +197,17 @@ def _apply_bucket(r: Recipe, model_type: str, bucket: str) -> Recipe:
         if model_type in ("qwen-image", "z-image"):
             pass  # steps↑ handled by solver using full window
     elif bucket == BUCKET_LOGO:
-        # Logo/text: caption carries the visible text -> dropout LOW here (the one exception
-        # to §3a), exact caption kept, conv on for sharp edges, resolution held at 1024.
-        r.use_exact_caption = True   # 📐 §3c
-        r.drop_trigger_word = False  # 📐 logo: caption matters
-        r.caption_dropout_rate = 0.10  # 📐 §3c exception: keep text signal in conditional path
-        r.resolution = "1024,1024"   # 📐 §3c: don't downscale text
+        # Logo/text: caption carries the visible text. dropout is PER-ARCH (📐) — pixel-L2
+        # metric is low-freq-dominated, so moderate dropout tuned to denoise strength
+        # (higher denoise -> conditioning matters more -> lower dropout). Exact caption kept,
+        # trigger KEPT (wins the 25% text term — opposite of other buckets), conv for edges.
+        r.use_exact_caption = True       # 📐 §3c
+        r.drop_trigger_word = False      # 📐 logo KEEPS trigger (other buckets drop it)
+        r.caption_dropout_rate = LOGO_CAPTION_DROPOUT[model_type]  # 📐 per-arch (A/B wajib)
+        r.resolution = "1024,1024"       # 📐 §3c: don't downscale text
+        r.flip_aug = False               # ✅ logo: mirror corrupts asymmetric glyphs (all arch)
         if model_type == "sdxl":
-            r.conv = 16              # 📐 §3c: conv ON (edges)
+            r.conv = 16                  # 📐 §3c: conv ON (edges)
             r.conv_alpha = 16
             r.network_kind = "locon"
         # qwen: rely on native text rendering — don't over-engineer the network (matriks §3c).
@@ -198,12 +219,14 @@ def _apply_bucket(r: Recipe, model_type: str, bucket: str) -> Recipe:
 def resolve_recipe(model_type: str, bucket: str, caption_dropout: float | None = None) -> Recipe:
     """Compose baseline -> unconditional override -> bucket delta.
 
-    caption_dropout lets Fase 2a-2 sweep the §3a lever without touching code.
+    caption_dropout lets Fase 2b sweep the §3a lever ({0.10,0.20,0.30,0.40}) per-call
+    WITHOUT touching code. When passed, it overrides the bucket default (incl. logo per-arch).
     """
-    cd = DEFAULT_CAPTION_DROPOUT if caption_dropout is None else caption_dropout
     r = _baseline(model_type)
-    r = _apply_unconditional(r, cd)
-    r = _apply_bucket(r, model_type, bucket)
+    r = _apply_unconditional(r, DEFAULT_CAPTION_DROPOUT)
+    r = _apply_bucket(r, model_type, bucket)        # may set bucket/per-arch dropout
+    if caption_dropout is not None:
+        r.caption_dropout_rate = caption_dropout    # explicit sweep override wins last
     return r
 
 

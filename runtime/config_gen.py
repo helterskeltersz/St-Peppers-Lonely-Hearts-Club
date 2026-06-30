@@ -61,7 +61,6 @@ def build_sd_scripts_config(r: Recipe, model_type: str, ctx: ConfigContext) -> d
         "network_alpha": r.alpha,
         "learning_rate": r.learning_rate,
         "unet_lr": r.unet_lr,
-        "text_encoder_lr": r.text_encoder_lr,
         "optimizer_type": r.optimizer,
         "lr_scheduler": r.scheduler,
         "resolution": r.resolution,
@@ -77,6 +76,12 @@ def build_sd_scripts_config(r: Recipe, model_type: str, ctx: ConfigContext) -> d
         cfg["network_args"] = network_args
     if r.min_snr_gamma is not None:              # SDXL only (epsilon); flux omits it
         cfg["min_snr_gamma"] = r.min_snr_gamma
+    if r.text_encoder_lr is not None:            # SDXL UNet-only -> None -> omit entirely
+        cfg["text_encoder_lr"] = r.text_encoder_lr
+    if r.train_unet_only is not None:            # SDXL True (drop both TEs); Flux False
+        cfg["network_train_unet_only"] = r.train_unet_only
+    if r.flip_aug is not None:                   # logo bucket -> False; else omit (trainer default)
+        cfg["flip_aug"] = r.flip_aug
 
     if model_type == "flux":
         cfg["discrete_flow_shift"] = r.discrete_flow_shift  # ✅ Flux only
@@ -84,9 +89,8 @@ def build_sd_scripts_config(r: Recipe, model_type: str, ctx: ConfigContext) -> d
         cfg["model_prediction_type"] = "raw"
         cfg["guidance_scale"] = 1.0
         cfg["apply_t5_attn_mask"] = True
-        # (2) TE-cache OFF so caption shuffle/dropout works + TE not force-frozen (§5b).
+        # (2) TE-cache OFF so caption shuffle/dropout works (§5b).
         cfg["cache_text_encoder_outputs"] = False
-        cfg["network_train_unet_only"] = False
     return cfg
 
 
@@ -130,6 +134,8 @@ def build_ai_toolkit_config(r: Recipe, model_type: str, ctx: ConfigContext) -> d
         "caption_dropout_rate": r.caption_dropout_rate,  # §3a lever #1 (ai-toolkit dataset block)
         "is_reg": False,
     }
+    if r.flip_aug is not None:                   # logo -> flip_x: false (mirror corrupts glyphs)
+        dataset_block["flip_x"] = r.flip_aug
 
     return {
         "job": "extension",
