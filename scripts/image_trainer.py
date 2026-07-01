@@ -28,9 +28,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trainer import constants as cst
 from trainer import training_paths as paths
-from runtime import recipe as recipe_mod
 from runtime import step_solver
-from runtime import subtype_classifier
+from runtime import dedup as dedup_mod
+from runtime import category_detection as catdet
+from runtime import caption as caption_mod
+from runtime import recipe_engine
+
+# Training is only launched when explicitly enabled (GPU phase). On the laptop/CPU
+# the engine resolves + writes a config and stops, so routing can be validated for $0.
+_ALLOW_TRAINING = os.getenv("ALLOW_TRAINING", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def log(msg: str) -> None:
@@ -72,24 +78,41 @@ def extract_dataset(zip_path: str, task_id: str) -> str:
     return images_dir
 
 
-def write_config_skeleton(task_id: str, model_type: str, recipe: recipe_mod.Recipe) -> str:
-    """Write a config skeleton to the path the toolchain expects.
+def _emit_toml(d: dict) -> str:
+    """Minimal TOML emitter for a flat overlay dict (scalars/str/lists). Keys with a
+    leading underscore are engine metadata and are written as comments."""
+    def fmt(v):
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return repr(v)
+        if isinstance(v, list):
+            return "[" + ", ".join(fmt(x) for x in v) + "]"
+        return '"' + str(v).replace('"', '\\"') + '"'
+    lines = []
+    for k, v in d.items():
+        if k.startswith("_"):
+            lines.append(f"# {k} = {v}")
+        else:
+            lines.append(f"{k} = {fmt(v)}")
+    return "\n".join(lines) + "\n"
 
-    sd-scripts (sdxl/flux) consume TOML; ai-toolkit (qwen/z) consume YAML. In Fase 1
-    the recipe is empty so this is a clearly-marked skeleton, NOT a runnable config.
-    """
+
+def write_config(task_id: str, model_type: str, overlay: dict) -> str:
+    """Write the resolved recipe. sd-scripts (sdxl/flux) => TOML overlay; ai-toolkit
+    (qwen/z) => JSON config. Base-TOML merge + runtime paths are wired at the GPU phase."""
     is_toolkit = model_type in cst.AI_TOOLKIT_MODEL_TYPES
-    ext = "yaml" if is_toolkit else "toml"
+    ext = "json" if is_toolkit else "toml"
     config_path = paths.get_config_save_path(task_id, ext)
     paths.ensure_dirs(cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH)
-    header = (
-        f"# FASE 1 SKELETON — recipe NOT filled (Fase 2).\n"
-        f"# model_type={model_type} toolchain={'ai-toolkit' if is_toolkit else 'sd-scripts'}\n"
-        f"# missing recipe fields: {recipe_mod.missing_fields(recipe)}\n"
-    )
     with open(config_path, "w", encoding="utf-8") as f:
-        f.write(header)
-    log(f"Wrote config skeleton -> {config_path}")
+        if is_toolkit:
+            import json
+            f.write(json.dumps(overlay, indent=2))
+        else:
+            f.write(f"# v3 recipe overlay ({model_type})\n")
+            f.write(_emit_toml(overlay))
+    log(f"Wrote config -> {config_path}")
     return config_path
 
 
@@ -126,31 +149,43 @@ def main() -> int:
     zip_path = resolve_dataset_zip(args.task_id, args.dataset_zip)
     images_dir = extract_dataset(zip_path, args.task_id)
 
-    # 2. classify subtype -> bucket (structure; recipe mapping is Fase 2)
-    bucket, confidence, sig = subtype_classifier.classify(images_dir, args.trigger_word)
-    log(f"signature={sig.to_dict()}")
-    log(f"bucket={bucket} confidence={confidence}")
+    # 2. dedup (pre-caption) — drop near-duplicates so no frame gets Nx repeat weight
+    dd = dedup_mod.dedup_dataset(images_dir)
+    log(f"dedup: {dd.get('n_before')}->{dd.get('n_after')} removed={dd.get('n_removed')} "
+        f"note={dd.get('note','')}")
 
-    # 3. deterministic window + step plan (it/s measured live in Fase 2)
-    plan = step_solver.build_plan(
-        num_pairs=sig.image_count,
-        model_type=args.model_type,
-        hours_to_complete=args.hours_to_complete,
-        it_per_s=None,
-    )
+    # 3. category (6-way keyword) + trigger recovery -> shape
+    prompts = catdet.read_caption_prompts(images_dir)
+    category = catdet.detect_category(prompts)
+    trigger = args.trigger_word or catdet.detect_trigger(prompts)
+    shape = catdet.category_shape(category)
+    n_images = len([f for r, _, fs in os.walk(images_dir) for f in fs
+                    if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))])
+    log(f"category={category} shape={shape} trigger={'yes' if trigger else 'no'} n={n_images}")
+
+    # 4. captions — verbatim+tail (subject/text-heavy) | rewrite (style); trigger kept
+    csum = caption_mod.build_captions(images_dir, category, args.model_type, trigger)
+    log(f"caption: mode={csum.get('mode')} vlm={csum.get('vlm')} {csum.get('note','')}")
+
+    # 5. deterministic window (upper cap) + step plan
+    plan = step_solver.build_plan(num_pairs=n_images, model_type=args.model_type,
+                                  hours_to_complete=args.hours_to_complete, it_per_s=None)
     log(f"predicted_window_hours={plan.window_hours} (target_steps pending live it/s)")
 
-    # 4. recipe (PLACEHOLDER in Fase 1)
-    recipe = recipe_mod.resolve_recipe(args.model_type, bucket)
-    config_path = write_config_skeleton(args.task_id, args.model_type, recipe)
+    # 6. resolve recipe (3-axis cascade) — sdxl/flux overlay OR qwen/z ai-toolkit config
+    if args.model_type in cst.AI_TOOLKIT_MODEL_TYPES:
+        overlay = recipe_engine.build_aitoolkit_config(args.model_type, n_images, category)
+    else:
+        overlay = recipe_engine.resolve_recipe(category, n_images, args.model, args.model_type)
+    log(f"recipe source={overlay.get('_source')} talla={overlay.get('_talla')}")
+    config_path = write_config(args.task_id, args.model_type, overlay)
 
-    # 5. gate: do not launch a real run without a recipe
-    if not recipe_mod.is_complete(recipe):
-        log("RECIPE NOT FILLED — Fase 1 scaffold stops here (no training launched).")
+    # 7. gate: launch training only when explicitly enabled (GPU phase)
+    if not _ALLOW_TRAINING:
+        log("ALLOW_TRAINING unset — config resolved & written; no training launched (CPU/validation mode).")
         log(f"Would run: {' '.join(build_training_command(args.model_type, config_path))}")
         return 0
 
-    # Fase 2 path (unreachable in Fase 1):
     cmd = build_training_command(args.model_type, config_path)
     log(f"Launching training: {' '.join(cmd)}")
     import subprocess

@@ -1,3 +1,5 @@
+> ⚠️ **DEPRECATED (v3)** — tesis §0/§3a (unconditional push, drop-trigger, dropout 0.30-0.50, UNet-only) DIBUANG. Lihat `MATRIKS_RECIPE_v3.md`. Disimpan untuk jejak sejarah saja.
+
 # MATRIKS RECIPE FINAL v2 — Turnamen Image G.O.D (Bittensor SN56)
 
 **Status dokumen:** Acuan tunggal (single source of truth) untuk fase penulisan recipe & kode.
